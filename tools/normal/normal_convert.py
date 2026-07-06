@@ -398,6 +398,31 @@ def compare_normals(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
     }
 
 
+def compare_model_alignment(n_exr_model: np.ndarray, n_model: np.ndarray) -> dict[str, Any]:
+    n_model = resize_normal_to(n_model, n_exr_model.shape[:2])
+    normal_metrics = compare_normals(n_exr_model, n_model)
+    rgb_exr = encode_packed_normal(n_exr_model)
+    rgb_model = encode_packed_normal(n_model)
+    rgb_diff = rgb_exr - rgb_model
+    model_mean = np.nanmean(n_model.reshape(-1, 3), axis=0)
+    source_mean = np.nanmean(n_exr_model.reshape(-1, 3), axis=0)
+    mean_angle = float(angular_error(source_mean.reshape(1, 1, 3), model_mean.reshape(1, 1, 3))[0, 0])
+    return {
+        "model_align_angular_mean_deg": normal_metrics["angular_mean_deg"],
+        "model_align_angular_median_deg": normal_metrics["angular_median_deg"],
+        "model_align_angular_p95_deg": normal_metrics["angular_p95_deg"],
+        "model_align_l1_normal": normal_metrics["l1_mean"],
+        "model_align_l2_normal": normal_metrics["l2_mean"],
+        "model_align_l1_rgb": float(np.nanmean(np.abs(rgb_diff))),
+        "model_align_l2_rgb": float(np.nanmean(np.linalg.norm(rgb_diff, axis=-1))),
+        "model_align_channel_mean": normal_metrics["channel_mean"],
+        "model_align_channel_std": normal_metrics["channel_std"],
+        "model_mean_normal": json.dumps([float(x) for x in model_mean]),
+        "source_transformed_mean_normal": json.dumps([float(x) for x in source_mean]),
+        "mean_normal_angular_deg": mean_angle,
+    }
+
+
 def resize_normal_to(n: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
     if n.shape[:2] == hw:
         return n
@@ -440,24 +465,33 @@ def cmd_compare(args: argparse.Namespace) -> None:
             labels: list[str] = []
             if stem in model:
                 n_model, _ = normal_from_image(model[stem])
+                n_model_for_error = resize_normal_to(n_model, n_src.shape[:2])
                 images.append(encode_packed_normal(n_model))
                 labels.append("model output")
+            else:
+                n_model_for_error = None
             images.append(encode_packed_normal(n_src))
             labels.append("source packed")
             n_transformed = normalize_normal(apply_matrix(n_src, matrix))
             images.append(encode_packed_normal(n_transformed))
             labels.append("source transformed")
+            if n_model_for_error is not None:
+                row.update(compare_model_alignment(n_transformed, n_model_for_error))
+                images.append(np.abs(encode_packed_normal(n_transformed) - encode_packed_normal(n_model_for_error)))
+                labels.append("model rgb diff")
+                images.append(heatmap(angular_error(n_transformed, n_model_for_error), vmax=90.0))
+                labels.append("angular_error_model_alignment")
             if stem in roundtrip:
                 n_round, _, _ = normal_from_exr(roundtrip[stem], config)
                 row.update({f"roundtrip_{k}": v for k, v in compare_normals(n_src, n_round).items()})
                 images.append(encode_packed_normal(n_round))
                 labels.append("roundtrip")
-                images.append(heatmap(angular_error(n_src, n_round)))
-                labels.append("angular error")
+                images.append(heatmap(angular_error(n_src, n_round), vmax=90.0))
+                labels.append("angular_error_roundtrip")
             if stem in converted and stem in model:
                 n_conv, _ = normal_from_image(converted[stem])
-                n_model, _ = normal_from_image(model[stem])
-                row.update({f"converted_vs_model_{k}": v for k, v in compare_normals(n_conv, n_model).items()})
+                n_model_file, _ = normal_from_image(model[stem])
+                row.update({f"converted_file_vs_model_{k}": v for k, v in compare_normals(n_conv, n_model_file).items()})
             if images:
                 make_montage(images, labels, out / "montage" / f"{stem}.png")
             rows.append(row)
@@ -478,6 +512,16 @@ def signed_permutation_matrices() -> list[np.ndarray]:
     return mats
 
 
+def dot_loss(n1: np.ndarray, n2: np.ndarray) -> float:
+    a = normalize_normal(n1)
+    b = normalize_normal(n2)
+    return float(np.nanmean(1.0 - np.clip(np.sum(a * b, axis=-1), -1.0, 1.0)))
+
+
+def matrix_is_identity(matrix: np.ndarray, atol: float = 1e-6) -> bool:
+    return bool(np.allclose(matrix, np.eye(3, dtype=np.float32), atol=atol))
+
+
 def cmd_calibrate(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     out = Path(args.output_dir)
@@ -487,48 +531,77 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     if not pairs:
         raise RuntimeError("No matching EXR/model PNG/JPG pairs found by stem.")
     matrices = signed_permutation_matrices()
-    loss_sums = np.zeros(len(matrices), dtype=np.float64)
+    dot_loss_sums = np.zeros(len(matrices), dtype=np.float64)
+    angular_sums = np.zeros(len(matrices), dtype=np.float64)
     per_pair_rows: list[dict[str, Any]] = []
-    per_pair_losses: list[np.ndarray] = []
+    per_pair_dot_losses: list[np.ndarray] = []
+    per_pair_angular_losses: list[np.ndarray] = []
     for _, src_path, model_path in pairs:
         n_src, _, _ = normal_from_exr(src_path, config)
         n_src = downsample_normal_max_side(n_src, args.max_side)
         n_model, _ = normal_from_image(model_path)
         n_model = resize_normal_to(n_model, n_src.shape[:2])
-        pair_losses = np.zeros(len(matrices), dtype=np.float64)
+        pair_dot_losses = np.zeros(len(matrices), dtype=np.float64)
+        pair_angular_losses = np.zeros(len(matrices), dtype=np.float64)
         for i, mat in enumerate(matrices):
             n_pred = normalize_normal(apply_matrix(n_src, mat))
-            loss = float(np.nanmean(angular_error(n_pred, n_model)))
-            loss_sums[i] += loss
-            pair_losses[i] = loss
-        best_i = int(np.argmin(pair_losses))
-        per_pair_losses.append(pair_losses)
+            dloss = dot_loss(n_pred, n_model)
+            aloss = float(np.nanmean(angular_error(n_pred, n_model)))
+            dot_loss_sums[i] += dloss
+            angular_sums[i] += aloss
+            pair_dot_losses[i] = dloss
+            pair_angular_losses[i] = aloss
+        best_i = int(np.argmin(pair_dot_losses))
+        per_pair_dot_losses.append(pair_dot_losses)
+        per_pair_angular_losses.append(pair_angular_losses)
         per_pair_rows.append(
             {
                 "stem": src_path.stem,
-                "best_angular_mean_deg": float(pair_losses[best_i]),
+                "best_dot_loss": float(pair_dot_losses[best_i]),
+                "best_angular_mean_deg": float(pair_angular_losses[best_i]),
                 "best_matrix": json.dumps(matrices[best_i].tolist()),
+                "global_best_dot_loss": "",
                 "global_best_loss_deg": "",
             }
         )
     candidates = [
-        {"matrix": mat, "angular_mean_deg": float(loss_sums[i] / len(pairs))}
+        {
+            "matrix": mat,
+            "dot_loss": float(dot_loss_sums[i] / len(pairs)),
+            "angular_mean_deg": float(angular_sums[i] / len(pairs)),
+        }
         for i, mat in enumerate(matrices)
     ]
-    candidates.sort(key=lambda x: x["angular_mean_deg"])
+    candidates.sort(key=lambda x: x["dot_loss"])
     rows = [
-        {"rank": i + 1, "angular_mean_deg": c["angular_mean_deg"], "matrix": json.dumps(c["matrix"].tolist())}
+        {
+            "rank": i + 1,
+            "dot_loss": c["dot_loss"],
+            "angular_mean_deg": c["angular_mean_deg"],
+            "is_identity": matrix_is_identity(c["matrix"]),
+            "matrix": json.dumps(c["matrix"].tolist()),
+        }
         for i, c in enumerate(candidates[: args.topk])
     ]
     write_csv(out / "calibration_topk.csv", rows)
     write_json(
         out / "calibration_topk.json",
-        [{"rank": i + 1, "angular_mean_deg": c["angular_mean_deg"], "matrix": c["matrix"].tolist()} for i, c in enumerate(candidates[: args.topk])],
+        [
+            {
+                "rank": i + 1,
+                "dot_loss": c["dot_loss"],
+                "angular_mean_deg": c["angular_mean_deg"],
+                "is_identity": matrix_is_identity(c["matrix"]),
+                "matrix": c["matrix"].tolist(),
+            }
+            for i, c in enumerate(candidates[: args.topk])
+        ],
     )
     best = np.asarray(candidates[0]["matrix"], dtype=np.float32)
     global_best_i = next(i for i, mat in enumerate(matrices) if np.array_equal(mat, best))
-    for row, pair_losses in zip(per_pair_rows, per_pair_losses):
-        row["global_best_loss_deg"] = float(pair_losses[global_best_i])
+    for row, pair_dot_losses, pair_angular_losses in zip(per_pair_rows, per_pair_dot_losses, per_pair_angular_losses):
+        row["global_best_dot_loss"] = float(pair_dot_losses[global_best_i])
+        row["global_best_loss_deg"] = float(pair_angular_losses[global_best_i])
     write_csv(out / "calibration_per_pair_best.csv", per_pair_rows)
     write_json(out / "calibration_per_pair_best.json", per_pair_rows)
     best_config = json.loads(json.dumps(config))
@@ -544,11 +617,41 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
             ["model output", "source packed", "best transformed", "angular error"],
             out / "montage" / f"{stem}.png",
         )
+    montage_pairs = pairs[: min(3, len(pairs))]
+    for rank, candidate in enumerate(candidates[: args.topk], start=1):
+        mat = np.asarray(candidate["matrix"], dtype=np.float32)
+        for stem, src_path, model_path in montage_pairs:
+            n_src, _, _ = normal_from_exr(src_path, config)
+            n_model, _ = normal_from_image(model_path)
+            n_model_for_error = resize_normal_to(n_model, n_src.shape[:2])
+            n_candidate = normalize_normal(apply_matrix(n_src, mat))
+            make_montage(
+                [
+                    encode_packed_normal(n_model),
+                    encode_packed_normal(n_src),
+                    encode_packed_normal(n_candidate),
+                    np.abs(encode_packed_normal(n_candidate) - encode_packed_normal(n_model_for_error)),
+                    heatmap(angular_error(n_candidate, n_model_for_error), vmax=90.0),
+                ],
+                ["model output", "source raw packed", f"candidate rank {rank}", "rgb difference", "angular error 0-90deg"],
+                out / "candidate_montage" / f"rank_{rank:02d}_{stem}.png",
+            )
+    warnings: list[str] = []
+    if float(candidates[0]["angular_mean_deg"]) > args.warn_degrees:
+        warnings.append(
+            "Best signed permutation is still poor. EXR normal may be in world-space while model output is camera-space, "
+            "or model output is not a reliable GT. A camera rotation based transform may be required."
+        )
+    if matrix_is_identity(best) and float(candidates[0]["angular_mean_deg"]) > args.warn_degrees:
+        warnings.append("Identity transform preserves roundtrip but does not align to model normal convention.")
     note = (
         "Calibration searched 48 signed permutation matrices. Inspect montage manually; "
         "model output quality, pose mismatch, world/camera space differences, or RGB/BGR mistakes can dominate this score."
     )
+    if warnings:
+        note += "\n\nWarnings:\n" + "\n".join(f"- {w}" for w in warnings)
     (out / "README_calibration.txt").write_text(note, encoding="utf-8")
+    write_json(out / "calibration_warnings.json", warnings)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -599,6 +702,7 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--recursive", action="store_true")
     calibrate.add_argument("--topk", type=int, default=10)
     calibrate.add_argument("--max_side", type=int, default=512, help="Downsample normal maps for calibration loss; use 0 for full resolution.")
+    calibrate.add_argument("--warn_degrees", type=float, default=30.0, help="Warn when best model-alignment angular mean remains above this threshold.")
     calibrate.set_defaults(func=cmd_calibrate)
     return parser
 

@@ -38,8 +38,10 @@ Created by `calibrate`. Contains:
 
 - `calibration_topk.csv` and `calibration_topk.json`: best signed axis permutation matrices.
 - `calibration_per_pair_best.csv` and `calibration_per_pair_best.json`: best signed permutation per image. If each image wants a different matrix, the data is probably not describable by one global RGB matrix.
+- `calibration_warnings.json`: warnings when the best signed permutation is still poor.
 - `best_exr_to_model_normal.yaml`: config using the best candidate matrix.
 - `montage/*.png`: visual checks for model output vs transformed EXR.
+- `candidate_montage/*.png`: top-k candidate visual checks. Each montage shows model output, source raw packed, candidate transformed normal, RGB difference, and fixed-range angular error.
 - `README_calibration.txt`: reminder that calibration is only a hint.
 
 `normal_converted/png16_model_convention/`
@@ -73,8 +75,10 @@ Each compare montage is laid out as:
 1. `model output`: original model JPG/PNG from `normal/`.
 2. `source packed`: source EXR packed directly for viewing, before transform.
 3. `source transformed`: source EXR after YAML matrix, packed as model normal.
-4. `roundtrip`: PNG16 converted back to EXR and previewed.
-5. `angular error`: error heatmap for source EXR vs round-trip EXR.
+4. `model rgb diff`: absolute RGB difference between model output and source transformed.
+5. `angular_error_model_alignment`: fixed 0-90 degree heatmap for model output vs source transformed.
+6. `roundtrip`: PNG16 converted back to EXR and previewed.
+7. `angular_error_roundtrip`: fixed 0-90 degree heatmap for source EXR vs round-trip EXR.
 
 To compare converted images with generated/model images, open:
 
@@ -92,8 +96,11 @@ normal_debug/compare/compare_summary.csv
 
 Important columns:
 
-- `converted_vs_model_angular_mean_deg`: lower means converted EXR normal is closer to model JPG/PNG.
-- `converted_vs_model_angular_p95_deg`: high-percentile mismatch.
+- `model_align_angular_mean_deg`: lower means transformed EXR normal is closer to model JPG/PNG.
+- `model_align_angular_p95_deg`: high-percentile model alignment mismatch.
+- `model_align_l1_rgb` and `model_align_l2_rgb`: packed RGB-space difference for visual-style checking.
+- `model_mean_normal` and `source_transformed_mean_normal`: mean decoded normal vectors for sanity checks.
+- `mean_normal_angular_deg`: angle between the two mean decoded normal vectors.
 - `roundtrip_angular_mean_deg`: should be tiny when using NPZ exact restore.
 - `roundtrip_l2_mean`: vector error for source EXR vs reconstructed EXR.
 
@@ -228,7 +235,8 @@ python tools/normal/normal_convert.py calibrate \
   --config configs/normal_conversion/exr_to_model_normal.yaml \
   --recursive \
   --topk 10 \
-  --max_side 512
+  --max_side 512 \
+  --warn_degrees 30
 ```
 
 Parameters:
@@ -240,6 +248,7 @@ Parameters:
 - `--recursive`: scan subfolders too.
 - `--topk`: number of best matrices to report.
 - `--max_side`: downsample long side for calibration loss. Use `0` for full resolution.
+- `--warn_degrees`: emit warning if the best signed permutation is still above this mean angular error.
 
 ### `exr2png`
 
@@ -290,6 +299,11 @@ Parameters:
 ### `compare`
 
 Compares original EXR, converted PNG, round-trip EXR, and model output PNG/JPG by matching filename stems.
+
+`compare` reports two separate concepts:
+
+- Round-trip error: source EXR vs reconstructed EXR. This only checks whether conversion preserved information.
+- Model alignment error: model output decoded normal vs source EXR transformed by the YAML matrix. This checks whether the coordinate convention is actually aligned.
 
 ```bash
 python tools/normal/normal_convert.py compare \
