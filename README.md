@@ -37,6 +37,7 @@ Created by `audit`. Contains:
 Created by `calibrate`. Contains:
 
 - `calibration_topk.csv` and `calibration_topk.json`: best signed axis permutation matrices.
+- `calibration_per_pair_best.csv` and `calibration_per_pair_best.json`: best signed permutation per image. If each image wants a different matrix, the data is probably not describable by one global RGB matrix.
 - `best_exr_to_model_normal.yaml`: config using the best candidate matrix.
 - `montage/*.png`: visual checks for model output vs transformed EXR.
 - `README_calibration.txt`: reminder that calibration is only a hint.
@@ -145,6 +146,16 @@ If the best matrix is visually correct, copy its `transform.matrix` into:
 
 ```text
 configs/normal_conversion/exr_to_model_normal.yaml
+```
+
+For this dataset, the current calibrated default matrix is:
+
+```yaml
+transform:
+  matrix:
+    - [0.0, -1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+    - [1.0, 0.0, 0.0]
 ```
 
 Then convert:
@@ -309,3 +320,5 @@ PNG16 is high precision but not mathematically lossless for EXR float32 data. Us
 Never use JPG as a conversion intermediate. JPG is only a reference format for model output.
 
 All coordinate conversion comes from `transform.matrix` in the YAML config. Do not hard-code coordinate conventions in the script.
+
+Normal map color differences are not always solvable by RGB channel permutation. Common normal representations include object/world/camera/view/tangent space. A single global matrix can fix channel order and sign convention, but it cannot convert world-space normals to camera-space normals across changing views unless camera extrinsics are available. In that case, use a per-frame view rotation, usually the normal transform derived from the camera/world matrix, then normalize before packing.

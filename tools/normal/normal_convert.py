@@ -488,14 +488,29 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
         raise RuntimeError("No matching EXR/model PNG/JPG pairs found by stem.")
     matrices = signed_permutation_matrices()
     loss_sums = np.zeros(len(matrices), dtype=np.float64)
+    per_pair_rows: list[dict[str, Any]] = []
+    per_pair_losses: list[np.ndarray] = []
     for _, src_path, model_path in pairs:
         n_src, _, _ = normal_from_exr(src_path, config)
         n_src = downsample_normal_max_side(n_src, args.max_side)
         n_model, _ = normal_from_image(model_path)
         n_model = resize_normal_to(n_model, n_src.shape[:2])
+        pair_losses = np.zeros(len(matrices), dtype=np.float64)
         for i, mat in enumerate(matrices):
             n_pred = normalize_normal(apply_matrix(n_src, mat))
-            loss_sums[i] += float(np.nanmean(angular_error(n_pred, n_model)))
+            loss = float(np.nanmean(angular_error(n_pred, n_model)))
+            loss_sums[i] += loss
+            pair_losses[i] = loss
+        best_i = int(np.argmin(pair_losses))
+        per_pair_losses.append(pair_losses)
+        per_pair_rows.append(
+            {
+                "stem": src_path.stem,
+                "best_angular_mean_deg": float(pair_losses[best_i]),
+                "best_matrix": json.dumps(matrices[best_i].tolist()),
+                "global_best_loss_deg": "",
+            }
+        )
     candidates = [
         {"matrix": mat, "angular_mean_deg": float(loss_sums[i] / len(pairs))}
         for i, mat in enumerate(matrices)
@@ -511,6 +526,11 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
         [{"rank": i + 1, "angular_mean_deg": c["angular_mean_deg"], "matrix": c["matrix"].tolist()} for i, c in enumerate(candidates[: args.topk])],
     )
     best = np.asarray(candidates[0]["matrix"], dtype=np.float32)
+    global_best_i = next(i for i, mat in enumerate(matrices) if np.array_equal(mat, best))
+    for row, pair_losses in zip(per_pair_rows, per_pair_losses):
+        row["global_best_loss_deg"] = float(pair_losses[global_best_i])
+    write_csv(out / "calibration_per_pair_best.csv", per_pair_rows)
+    write_json(out / "calibration_per_pair_best.json", per_pair_rows)
     best_config = json.loads(json.dumps(config))
     best_config["transform"]["matrix"] = best.tolist()
     dump_simple_yaml(best_config, out / "best_exr_to_model_normal.yaml")
