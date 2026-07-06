@@ -1,0 +1,20 @@
+# Input data and generated artifacts
+/normal/
+/normal_converted/
+/normal_debug/
+
+# Python runtime noise
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local environments and editor files
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

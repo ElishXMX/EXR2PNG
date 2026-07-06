@@ -1,0 +1,31 @@
+source:
+  name: vccsim_exr
+  file_ext: [".exr"]
+  expected_range: auto
+  channel_order: RGB
+  ignore_alpha: true
+  normalize: true
+
+target:
+  name: model_normal
+  file_ext: ".png"
+  png_bit_depth: 16
+  packed_range: zero_to1
+  channel_order: RGB
+  normalize: true
+
+transform:
+  matrix:
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+    - [0.0, 0.0, 1.0]
+
+roundtrip:
+  save_json_sidecar: true
+  save_npz_sidecar: true
+  exact_npz_roundtrip: false
+
+output:
+  save_preview_png8: true
+  save_montage: true
+  save_stats_json: true
