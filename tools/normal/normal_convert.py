@@ -161,6 +161,32 @@ def matrix_from_config(config: dict[str, Any]) -> np.ndarray:
     return np.asarray(config["transform"]["matrix"], dtype=np.float32).reshape(3, 3)
 
 
+def load_matrix_csv(path: str | Path | None) -> dict[str, np.ndarray]:
+    if not path:
+        return {}
+    matrix_path = Path(path)
+    if not matrix_path.exists():
+        raise FileNotFoundError(f"Matrix CSV not found: {matrix_path}")
+    result: dict[str, np.ndarray] = {}
+    with matrix_path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            stem = row.get("stem") or row.get("source_stem") or row.get("source") or ""
+            if not stem:
+                continue
+            stem = Path(stem).stem
+            matrix_text = row.get("best_matrix") or row.get("matrix") or row.get("transform_matrix")
+            if not matrix_text:
+                continue
+            result[stem] = np.asarray(json.loads(matrix_text), dtype=np.float32).reshape(3, 3)
+    return result
+
+
+def matrix_for_stem(stem: str, default_matrix: np.ndarray, matrix_by_stem: dict[str, np.ndarray]) -> tuple[np.ndarray, str]:
+    if stem in matrix_by_stem:
+        return matrix_by_stem[stem], "matrix_csv"
+    return default_matrix, "config"
+
+
 def list_files(root: str | Path, exts: set[str], recursive: bool) -> list[Path]:
     root = Path(root)
     globber = root.rglob if recursive else root.glob
@@ -261,12 +287,14 @@ def cmd_audit(args: argparse.Namespace) -> None:
 
 def cmd_exr2png(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    matrix = matrix_from_config(config)
-    inv = np.linalg.inv(matrix)
+    default_matrix = matrix_from_config(config)
+    matrix_by_stem = load_matrix_csv(getattr(args, "matrix_csv", None))
     input_root = Path(args.input_dir)
     output_root = Path(args.output_dir)
     rows: list[dict[str, Any]] = []
     for path in list_files(input_root, EXR_EXTS, args.recursive):
+        matrix, matrix_source = matrix_for_stem(path.stem, default_matrix, matrix_by_stem)
+        inv = np.linalg.inv(matrix)
         n_source, guessed, raw_arr = normal_from_exr(path, config)
         n_model = normalize_normal(apply_matrix(n_source, matrix))
         packed = encode_packed_normal(n_model)
@@ -282,6 +310,7 @@ def cmd_exr2png(args: argparse.Namespace) -> None:
             "source_shape": list(raw_arr.shape),
             "source_range_guess": guessed,
             "transform_matrix": matrix.tolist(),
+            "transform_matrix_source": matrix_source,
             "inverse_matrix": inv.tolist(),
             "png_bit_depth": 16,
             "alpha": "ignored_from_source",
@@ -299,21 +328,23 @@ def cmd_exr2png(args: argparse.Namespace) -> None:
                 inverse_matrix=inv.astype(np.float32),
                 metadata=json.dumps(meta, ensure_ascii=False),
             )
-        rows.append({"source": str(path), "output": str(out_png), "range": guessed, **qerr})
+        rows.append({"source": str(path), "output": str(out_png), "range": guessed, "transform_matrix_source": matrix_source, **qerr})
     write_csv(output_root / "exr2png_summary.csv", rows)
     write_json(output_root / "exr2png_summary.json", rows)
 
 
 def cmd_png2exr(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    matrix = matrix_from_config(config)
-    inv = np.linalg.inv(matrix)
+    default_matrix = matrix_from_config(config)
+    matrix_by_stem = load_matrix_csv(getattr(args, "matrix_csv", None))
     input_root = Path(args.input_dir)
     output_root = Path(args.output_dir)
     rows: list[dict[str, Any]] = []
     for path in list_files(input_root, IMAGE_EXTS, args.recursive):
         if path.name.endswith("_preview.png"):
             continue
+        matrix, matrix_source = matrix_for_stem(path.stem, default_matrix, matrix_by_stem)
+        inv = np.linalg.inv(matrix)
         npz_path = path.with_suffix(".npz")
         restore_mode = "inverse_matrix"
         warning = ""
@@ -347,12 +378,13 @@ def cmd_png2exr(args: argparse.Namespace) -> None:
             "restore_mode": restore_mode,
             "warning": warning,
             "transform_matrix": matrix.tolist(),
+            "transform_matrix_source": matrix_source,
             "inverse_matrix": inv.tolist(),
             "alpha_written": 1.0,
             "stats_source_normal": stats_normal(n_source),
         }
         write_json(out_exr.with_suffix(".json"), meta)
-        rows.append({"source": str(path), "output": str(out_exr), "restore_mode": restore_mode, "warning": warning})
+        rows.append({"source": str(path), "output": str(out_exr), "restore_mode": restore_mode, "transform_matrix_source": matrix_source, "warning": warning})
     write_csv(output_root / "png2exr_summary.csv", rows)
     write_json(output_root / "png2exr_summary.json", rows)
 
@@ -450,7 +482,8 @@ def downsample_normal_max_side(n: np.ndarray, max_side: int) -> np.ndarray:
 
 def cmd_compare(args: argparse.Namespace) -> None:
     config = load_config(args.config)
-    matrix = matrix_from_config(config)
+    default_matrix = matrix_from_config(config)
+    matrix_by_stem = load_matrix_csv(getattr(args, "matrix_csv", None))
     out = Path(args.output_dir)
     source = stems_map(list_files(args.source_exr_dir, EXR_EXTS, args.recursive))
     converted = stems_map(list_files(args.converted_png_dir, {".png"}, args.recursive))
@@ -460,7 +493,8 @@ def cmd_compare(args: argparse.Namespace) -> None:
     for stem, src_path in source.items():
         try:
             n_src, _, _ = normal_from_exr(src_path, config)
-            row: dict[str, Any] = {"stem": stem}
+            matrix, matrix_source = matrix_for_stem(stem, default_matrix, matrix_by_stem)
+            row: dict[str, Any] = {"stem": stem, "transform_matrix_source": matrix_source, "transform_matrix": json.dumps(matrix.tolist())}
             images: list[np.ndarray] = []
             labels: list[str] = []
             if stem in model:
@@ -672,6 +706,7 @@ def build_parser() -> argparse.ArgumentParser:
     exr2png.add_argument("--recursive", action="store_true")
     exr2png.add_argument("--save_npz", action="store_true")
     exr2png.add_argument("--save_preview", action="store_true")
+    exr2png.add_argument("--matrix_csv", help="Optional per-stem matrix CSV, for example calibration_per_pair_best.csv.")
     exr2png.set_defaults(func=cmd_exr2png)
 
     png2exr = sub.add_parser("png2exr")
@@ -681,6 +716,7 @@ def build_parser() -> argparse.ArgumentParser:
     png2exr.add_argument("--recursive", action="store_true")
     png2exr.add_argument("--prefer_npz_if_available", action="store_true")
     png2exr.add_argument("--save_preview", action="store_true")
+    png2exr.add_argument("--matrix_csv", help="Optional per-stem matrix CSV used when NPZ exact restore is not available.")
     png2exr.set_defaults(func=cmd_png2exr)
 
     compare = sub.add_parser("compare")
@@ -692,6 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--config", required=True)
     compare.add_argument("--recursive", action="store_true")
     compare.add_argument("--pairs_csv")
+    compare.add_argument("--matrix_csv", help="Optional per-stem matrix CSV used to transform source EXR before model alignment.")
     compare.set_defaults(func=cmd_compare)
 
     calibrate = sub.add_parser("calibrate")

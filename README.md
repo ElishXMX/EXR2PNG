@@ -177,6 +177,19 @@ python tools/normal/normal_convert.py exr2png \
   --save_preview
 ```
 
+If one global matrix is not enough, use the per-image matrices from calibration. This is the current recommended workflow for the included sample set:
+
+```bash
+python tools/normal/normal_convert.py exr2png \
+  --input_dir ./normal \
+  --output_dir ./normal_converted/png16_per_image_aligned \
+  --config configs/normal_conversion/exr_to_model_normal.yaml \
+  --recursive \
+  --save_npz \
+  --save_preview \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_best.csv
+```
+
 Round-trip back to EXR:
 
 ```bash
@@ -187,6 +200,19 @@ python tools/normal/normal_convert.py png2exr \
   --recursive \
   --prefer_npz_if_available \
   --save_preview
+```
+
+For per-image aligned outputs:
+
+```bash
+python tools/normal/normal_convert.py png2exr \
+  --input_dir ./normal_converted/png16_per_image_aligned \
+  --output_dir ./normal_converted/roundtrip_exr_per_image \
+  --config configs/normal_conversion/exr_to_model_normal.yaml \
+  --recursive \
+  --prefer_npz_if_available \
+  --save_preview \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_best.csv
 ```
 
 Compare everything:
@@ -201,6 +227,22 @@ python tools/normal/normal_convert.py compare \
   --config configs/normal_conversion/exr_to_model_normal.yaml \
   --recursive
 ```
+
+For per-image aligned outputs:
+
+```bash
+python tools/normal/normal_convert.py compare \
+  --source_exr_dir ./normal \
+  --converted_png_dir ./normal_converted/png16_per_image_aligned \
+  --roundtrip_exr_dir ./normal_converted/roundtrip_exr_per_image \
+  --model_png_dir ./normal \
+  --output_dir ./normal_debug/compare_per_image \
+  --config configs/normal_conversion/exr_to_model_normal.yaml \
+  --recursive \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_best.csv
+```
+
+With the current sample set, per-image alignment is much better than the single global matrix. The latest measured model-alignment mean angular error is about `33.36` degrees, with round-trip error still around `1e-6` degrees when NPZ exact restore is used. This is basic visual alignment, not proof that the normals are physically in the same space.
 
 ## Command Reference
 
@@ -261,7 +303,8 @@ python tools/normal/normal_convert.py exr2png \
   --config configs/normal_conversion/exr_to_model_normal.yaml \
   --recursive \
   --save_npz \
-  --save_preview
+  --save_preview \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_best.csv
 ```
 
 Parameters:
@@ -272,6 +315,7 @@ Parameters:
 - `--recursive`: scan subfolders too.
 - `--save_npz`: write exact float sidecars for exact round-trip.
 - `--save_preview`: write PNG8 preview images.
+- `--matrix_csv`: optional per-stem matrix CSV. Use `normal_debug/calibration/calibration_per_pair_best.csv` for per-image aligned conversion.
 
 ### `png2exr`
 
@@ -284,7 +328,8 @@ python tools/normal/normal_convert.py png2exr \
   --config configs/normal_conversion/exr_to_model_normal.yaml \
   --recursive \
   --prefer_npz_if_available \
-  --save_preview
+  --save_preview \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_best.csv
 ```
 
 Parameters:
@@ -295,6 +340,7 @@ Parameters:
 - `--recursive`: scan subfolders too.
 - `--prefer_npz_if_available`: if a same-stem `.npz` exists, restore original float normals exactly.
 - `--save_preview`: write PNG8 preview images.
+- `--matrix_csv`: optional per-stem matrix CSV used for inverse conversion when NPZ exact restore is unavailable.
 
 ### `compare`
 
@@ -313,7 +359,8 @@ python tools/normal/normal_convert.py compare \
   --model_png_dir ./normal \
   --output_dir ./normal_debug/compare \
   --config configs/normal_conversion/exr_to_model_normal.yaml \
-  --recursive
+  --recursive \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_best.csv
 ```
 
 Parameters:
@@ -326,6 +373,7 @@ Parameters:
 - `--config`: YAML config path.
 - `--recursive`: scan subfolders too.
 - `--pairs_csv`: optional explicit pairing CSV. Use columns `source`/`model` or `source_stem`/`model_stem`.
+- `--matrix_csv`: optional per-stem matrix CSV used for model-alignment evaluation.
 
 ## Notes
 
