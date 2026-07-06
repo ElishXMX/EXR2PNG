@@ -556,6 +556,49 @@ def matrix_is_identity(matrix: np.ndarray, atol: float = 1e-6) -> bool:
     return bool(np.allclose(matrix, np.eye(3, dtype=np.float32), atol=atol))
 
 
+def fit_orthogonal_matrix(n_src: np.ndarray, n_model: np.ndarray) -> np.ndarray:
+    x = normalize_normal(n_src).reshape(-1, 3)
+    y = normalize_normal(n_model).reshape(-1, 3)
+    mask = np.isfinite(x).all(axis=1) & np.isfinite(y).all(axis=1)
+    x = x[mask]
+    y = y[mask]
+    h = y.T @ x
+    u, _, vt = np.linalg.svd(h)
+    r = u @ vt
+    if np.linalg.det(r) < 0:
+        u[:, -1] *= -1.0
+        r = u @ vt
+    return r.astype(np.float32)
+
+
+def fit_linear_matrix(n_src: np.ndarray, n_model: np.ndarray, ridge: float = 1e-4) -> np.ndarray:
+    x = normalize_normal(n_src).reshape(-1, 3)
+    y = normalize_normal(n_model).reshape(-1, 3)
+    mask = np.isfinite(x).all(axis=1) & np.isfinite(y).all(axis=1)
+    x = x[mask]
+    y = y[mask]
+    xtx = x.T @ x
+    xty = x.T @ y
+    coeff = np.linalg.solve(xtx + np.eye(3, dtype=np.float32) * ridge, xty)
+    return coeff.T.astype(np.float32)
+
+
+def fitted_matrix_row(stem: str, mode: str, matrix: np.ndarray, n_src: np.ndarray, n_model: np.ndarray) -> dict[str, Any]:
+    pred = normalize_normal(apply_matrix(n_src, matrix))
+    ae = angular_error(pred, n_model)
+    return {
+        "stem": stem,
+        "mode": mode,
+        "dot_loss": dot_loss(pred, n_model),
+        "angular_mean_deg": float(np.nanmean(ae)),
+        "angular_median_deg": float(np.nanmedian(ae)),
+        "angular_p95_deg": float(np.nanpercentile(ae, 95)),
+        "determinant": float(np.linalg.det(matrix)),
+        "condition_number": float(np.linalg.cond(matrix)),
+        "best_matrix": json.dumps(matrix.tolist()),
+    }
+
+
 def cmd_calibrate(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     out = Path(args.output_dir)
@@ -570,6 +613,8 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
     per_pair_rows: list[dict[str, Any]] = []
     per_pair_dot_losses: list[np.ndarray] = []
     per_pair_angular_losses: list[np.ndarray] = []
+    orthogonal_rows: list[dict[str, Any]] = []
+    linear_rows: list[dict[str, Any]] = []
     for _, src_path, model_path in pairs:
         n_src, _, _ = normal_from_exr(src_path, config)
         n_src = downsample_normal_max_side(n_src, args.max_side)
@@ -598,6 +643,10 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
                 "global_best_loss_deg": "",
             }
         )
+        orthogonal_matrix = fit_orthogonal_matrix(n_src, n_model)
+        linear_matrix = fit_linear_matrix(n_src, n_model, ridge=args.linear_ridge)
+        orthogonal_rows.append(fitted_matrix_row(src_path.stem, "orthogonal", orthogonal_matrix, n_src, n_model))
+        linear_rows.append(fitted_matrix_row(src_path.stem, "linear", linear_matrix, n_src, n_model))
     candidates = [
         {
             "matrix": mat,
@@ -638,6 +687,10 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
         row["global_best_loss_deg"] = float(pair_angular_losses[global_best_i])
     write_csv(out / "calibration_per_pair_best.csv", per_pair_rows)
     write_json(out / "calibration_per_pair_best.json", per_pair_rows)
+    write_csv(out / "calibration_per_pair_orthogonal.csv", orthogonal_rows)
+    write_json(out / "calibration_per_pair_orthogonal.json", orthogonal_rows)
+    write_csv(out / "calibration_per_pair_linear.csv", linear_rows)
+    write_json(out / "calibration_per_pair_linear.json", linear_rows)
     best_config = json.loads(json.dumps(config))
     best_config["transform"]["matrix"] = best.tolist()
     dump_simple_yaml(best_config, out / "best_exr_to_model_normal.yaml")
@@ -670,6 +723,31 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
                 ["model output", "source raw packed", f"candidate rank {rank}", "rgb difference", "angular error 0-90deg"],
                 out / "candidate_montage" / f"rank_{rank:02d}_{stem}.png",
             )
+    fitted_rows_by_mode = {
+        "orthogonal": {row["stem"]: row for row in orthogonal_rows},
+        "linear": {row["stem"]: row for row in linear_rows},
+    }
+    for mode, rows_by_stem in fitted_rows_by_mode.items():
+        for stem, src_path, model_path in montage_pairs:
+            row = rows_by_stem.get(stem)
+            if row is None:
+                continue
+            mat = np.asarray(json.loads(row["best_matrix"]), dtype=np.float32)
+            n_src, _, _ = normal_from_exr(src_path, config)
+            n_model, _ = normal_from_image(model_path)
+            n_model_for_error = resize_normal_to(n_model, n_src.shape[:2])
+            n_candidate = normalize_normal(apply_matrix(n_src, mat))
+            make_montage(
+                [
+                    encode_packed_normal(n_model),
+                    encode_packed_normal(n_src),
+                    encode_packed_normal(n_candidate),
+                    np.abs(encode_packed_normal(n_candidate) - encode_packed_normal(n_model_for_error)),
+                    heatmap(angular_error(n_candidate, n_model_for_error), vmax=90.0),
+                ],
+                ["model output", "source raw packed", f"{mode} fitted", "rgb difference", "angular error 0-90deg"],
+                out / "fitted_montage" / f"{mode}_{stem}.png",
+            )
     warnings: list[str] = []
     if float(candidates[0]["angular_mean_deg"]) > args.warn_degrees:
         warnings.append(
@@ -678,9 +756,14 @@ def cmd_calibrate(args: argparse.Namespace) -> None:
         )
     if matrix_is_identity(best) and float(candidates[0]["angular_mean_deg"]) > args.warn_degrees:
         warnings.append("Identity transform preserves roundtrip but does not align to model normal convention.")
+    linear_mean = float(np.mean([float(row["angular_mean_deg"]) for row in linear_rows])) if linear_rows else float("nan")
+    orthogonal_mean = float(np.mean([float(row["angular_mean_deg"]) for row in orthogonal_rows])) if orthogonal_rows else float("nan")
     note = (
         "Calibration searched 48 signed permutation matrices. Inspect montage manually; "
-        "model output quality, pose mismatch, world/camera space differences, or RGB/BGR mistakes can dominate this score."
+        "model output quality, pose mismatch, world/camera space differences, or RGB/BGR mistakes can dominate this score.\n\n"
+        f"Per-image orthogonal mean angular error: {orthogonal_mean:.4f} deg\n"
+        f"Per-image linear mean angular error: {linear_mean:.4f} deg\n"
+        "Linear matrices are best treated as a visual alignment approximation, not a physical camera rotation."
     )
     if warnings:
         note += "\n\nWarnings:\n" + "\n".join(f"- {w}" for w in warnings)
@@ -740,6 +823,7 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--topk", type=int, default=10)
     calibrate.add_argument("--max_side", type=int, default=512, help="Downsample normal maps for calibration loss; use 0 for full resolution.")
     calibrate.add_argument("--warn_degrees", type=float, default=30.0, help="Warn when best model-alignment angular mean remains above this threshold.")
+    calibrate.add_argument("--linear_ridge", type=float, default=1e-4, help="Ridge regularization for per-image linear matrix fitting.")
     calibrate.set_defaults(func=cmd_calibrate)
     return parser
 

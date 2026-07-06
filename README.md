@@ -38,6 +38,8 @@ Created by `calibrate`. Contains:
 
 - `calibration_topk.csv` and `calibration_topk.json`: best signed axis permutation matrices.
 - `calibration_per_pair_best.csv` and `calibration_per_pair_best.json`: best signed permutation per image. If each image wants a different matrix, the data is probably not describable by one global RGB matrix.
+- `calibration_per_pair_orthogonal.csv`: per-image fitted rotation matrices. This is the closest option to a camera/view rotation when camera pose is unavailable.
+- `calibration_per_pair_linear.csv`: per-image fitted linear matrices. This usually gives the best visual alignment, but it is an approximation and is not a physically pure normal-space rotation.
 - `calibration_warnings.json`: warnings when the best signed permutation is still poor.
 - `best_exr_to_model_normal.yaml`: config using the best candidate matrix.
 - `montage/*.png`: visual checks for model output vs transformed EXR.
@@ -242,7 +244,43 @@ python tools/normal/normal_convert.py compare \
   --matrix_csv normal_debug/calibration/calibration_per_pair_best.csv
 ```
 
-With the current sample set, per-image alignment is much better than the single global matrix. The latest measured model-alignment mean angular error is about `33.36` degrees, with round-trip error still around `1e-6` degrees when NPZ exact restore is used. This is basic visual alignment, not proof that the normals are physically in the same space.
+With the current sample set, per-image alignment is much better than the single global matrix. Signed permutation per-image alignment reaches about `33.36` degrees mean model-alignment error. Per-image linear alignment reaches about `15.16` degrees mean error, with round-trip error still around `1e-6` degrees when NPZ exact restore is used. Linear alignment is the best current visual match, but it is not proof that the normals are physically in the same space.
+
+For the strongest current visual alignment, use the linear matrix CSV:
+
+```bash
+python tools/normal/normal_convert.py exr2png \
+  --input_dir ./normal \
+  --output_dir ./normal_converted/png16_per_image_linear_aligned \
+  --config configs/normal_conversion/exr_to_model_normal.yaml \
+  --recursive \
+  --save_npz \
+  --save_preview \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_linear.csv
+```
+
+```bash
+python tools/normal/normal_convert.py png2exr \
+  --input_dir ./normal_converted/png16_per_image_linear_aligned \
+  --output_dir ./normal_converted/roundtrip_exr_per_image_linear \
+  --config configs/normal_conversion/exr_to_model_normal.yaml \
+  --recursive \
+  --prefer_npz_if_available \
+  --save_preview \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_linear.csv
+```
+
+```bash
+python tools/normal/normal_convert.py compare \
+  --source_exr_dir ./normal \
+  --converted_png_dir ./normal_converted/png16_per_image_linear_aligned \
+  --roundtrip_exr_dir ./normal_converted/roundtrip_exr_per_image_linear \
+  --model_png_dir ./normal \
+  --output_dir ./normal_debug/compare_per_image_linear \
+  --config configs/normal_conversion/exr_to_model_normal.yaml \
+  --recursive \
+  --matrix_csv normal_debug/calibration/calibration_per_pair_linear.csv
+```
 
 ## Command Reference
 
@@ -278,7 +316,8 @@ python tools/normal/normal_convert.py calibrate \
   --recursive \
   --topk 10 \
   --max_side 512 \
-  --warn_degrees 30
+  --warn_degrees 30 \
+  --linear_ridge 1e-4
 ```
 
 Parameters:
@@ -291,6 +330,7 @@ Parameters:
 - `--topk`: number of best matrices to report.
 - `--max_side`: downsample long side for calibration loss. Use `0` for full resolution.
 - `--warn_degrees`: emit warning if the best signed permutation is still above this mean angular error.
+- `--linear_ridge`: regularization for per-image linear matrix fitting.
 
 ### `exr2png`
 
@@ -381,6 +421,8 @@ PNG16 is high precision but not mathematically lossless for EXR float32 data. Us
 
 Never use JPG as a conversion intermediate. JPG is only a reference format for model output.
 
-All coordinate conversion comes from `transform.matrix` in the YAML config. Do not hard-code coordinate conventions in the script.
+All global coordinate conversion comes from `transform.matrix` in the YAML config. Per-image matrix CSV files can override it by stem when passed with `--matrix_csv`.
 
 Normal map color differences are not always solvable by RGB channel permutation. Common normal representations include object/world/camera/view/tangent space. A single global matrix can fix channel order and sign convention, but it cannot convert world-space normals to camera-space normals across changing views unless camera extrinsics are available. In that case, use a per-frame view rotation, usually the normal transform derived from the camera/world matrix, then normalize before packing.
+
+The per-image linear matrix path is useful when you need a practical visual match to model output and do not have camera pose. Treat it as a calibration approximation. If you need physically meaningful normals, prefer real camera pose based world-to-view normal conversion over fitted linear matrices.
