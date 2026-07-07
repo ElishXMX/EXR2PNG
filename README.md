@@ -357,6 +357,68 @@ Parameters:
 - `--save_preview`: write PNG8 preview images.
 - `--matrix_csv`: optional per-stem matrix CSV. Use `normal_debug/calibration/calibration_per_pair_best.csv` for per-image aligned conversion.
 
+### `pose2png`
+
+Converts world-space EXR normals to camera/view-space packed PNG normals using UE camera poses.
+
+The expected pose format is `poses.txt`:
+
+```text
+Timestamp X Y Z Qx Qy Qz Qw
+```
+
+with UE axes:
+
+```text
++X forward, +Y right, +Z up
+```
+
+For the updated dataset with `Normal_Cam00_Pose###.exr` and `poses.txt`, the best checked convention against `0003.jpg` is currently `right_up_backward`:
+
+```bash
+python tools/normal/normal_convert.py pose2png \
+  --input_dir ./normal \
+  --output_dir ./normal_converted/pose_camera_right_up_backward \
+  --config configs/normal_conversion/exr_to_model_normal.yaml \
+  --poses ./normal/poses.txt \
+  --recursive \
+  --save_preview \
+  --save_npz \
+  --convention right_up_backward
+```
+
+For a quick single-pose check:
+
+```bash
+python tools/normal/normal_convert.py pose2png \
+  --input_dir ./normal \
+  --output_dir ./normal_converted/pose003_right_up_backward \
+  --config configs/normal_conversion/exr_to_model_normal.yaml \
+  --poses ./normal/poses.txt \
+  --recursive \
+  --save_preview \
+  --save_npz \
+  --convention right_up_backward \
+  --start_pose 3 \
+  --end_pose 3 \
+  --montage_count 1
+```
+
+Parameters:
+
+- `--input_dir`: folder containing source EXR files.
+- `--output_dir`: destination for pose-transformed PNG outputs.
+- `--config`: YAML config path.
+- `--poses`: UE `poses.txt` path.
+- `--recursive`: scan subfolders too.
+- `--save_preview`: write PNG8 preview images.
+- `--save_npz`: write exact float sidecars.
+- `--preview_only`: write PNG8 previews directly, useful for fast visual scans.
+- `--convention`: camera normal packing convention. Repeat to output multiple variants. Current recommended value is `right_up_backward`.
+- `--start_pose` and `--end_pose`: process only a pose index range.
+- `--limit`: maximum number of EXR files to process.
+- `--montage_count`: number of variant montages to write.
+
 ### `png2exr`
 
 Converts model PNG/JPG or generated PNG16 normals back to source EXR convention.

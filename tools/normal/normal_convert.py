@@ -161,6 +161,83 @@ def matrix_from_config(config: dict[str, Any]) -> np.ndarray:
     return np.asarray(config["transform"]["matrix"], dtype=np.float32).reshape(3, 3)
 
 
+def quat_xyzw_to_matrix(q: list[float] | np.ndarray) -> np.ndarray:
+    x, y, z, w = [float(v) for v in q]
+    norm = (x * x + y * y + z * z + w * w) ** 0.5
+    if norm <= 1e-8:
+        return np.eye(3, dtype=np.float32)
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+    return np.asarray(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def load_poses_txt(path: str | Path | None) -> dict[str, dict[str, Any]]:
+    if not path:
+        return {}
+    pose_path = Path(path)
+    poses: dict[str, dict[str, Any]] = {}
+    for raw in pose_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        timestamp = int(round(float(parts[0])))
+        position = np.asarray([float(v) for v in parts[1:4]], dtype=np.float32)
+        quat = np.asarray([float(v) for v in parts[4:8]], dtype=np.float32)
+        rot_c2w = quat_xyzw_to_matrix(quat)
+        record = {
+            "timestamp": timestamp,
+            "position": position,
+            "quaternion_xyzw": quat,
+            "rotation_camera_to_world": rot_c2w,
+            "rotation_world_to_camera": rot_c2w.T,
+        }
+        poses[str(timestamp)] = record
+        poses[f"{timestamp:03d}"] = record
+    return poses
+
+
+def pose_key_from_stem(stem: str) -> str:
+    import re
+
+    match = re.search(r"Pose(\d+)", stem)
+    if match:
+        return match.group(1)
+    nums = re.findall(r"\d+", stem)
+    return nums[-1] if nums else stem
+
+
+POSE_CAMERA_CONVENTIONS: dict[str, np.ndarray] = {
+    # UE camera local: +X forward, +Y right, +Z up.
+    "ue_camera_xyz": np.asarray([[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32),
+    # Common image/camera packed variants from UE camera local.
+    "right_up_forward": np.asarray([[0, 1, 0], [0, 0, 1], [1, 0, 0]], dtype=np.float32),
+    "right_down_forward": np.asarray([[0, 1, 0], [0, 0, -1], [1, 0, 0]], dtype=np.float32),
+    "left_up_forward": np.asarray([[0, -1, 0], [0, 0, 1], [1, 0, 0]], dtype=np.float32),
+    "left_down_forward": np.asarray([[0, -1, 0], [0, 0, -1], [1, 0, 0]], dtype=np.float32),
+    "right_up_backward": np.asarray([[0, 1, 0], [0, 0, 1], [-1, 0, 0]], dtype=np.float32),
+    "right_down_backward": np.asarray([[0, 1, 0], [0, 0, -1], [-1, 0, 0]], dtype=np.float32),
+}
+
+
+def pose_world_to_camera_matrix(stem: str, poses: dict[str, dict[str, Any]]) -> tuple[np.ndarray | None, dict[str, Any] | None]:
+    if not poses:
+        return None, None
+    key = pose_key_from_stem(stem)
+    pose = poses.get(key) or poses.get(str(int(key)) if key.isdigit() else key)
+    if pose is None:
+        return None, None
+    return np.asarray(pose["rotation_world_to_camera"], dtype=np.float32), pose
+
+
 def load_matrix_csv(path: str | Path | None) -> dict[str, np.ndarray]:
     if not path:
         return {}
@@ -331,6 +408,99 @@ def cmd_exr2png(args: argparse.Namespace) -> None:
         rows.append({"source": str(path), "output": str(out_png), "range": guessed, "transform_matrix_source": matrix_source, **qerr})
     write_csv(output_root / "exr2png_summary.csv", rows)
     write_json(output_root / "exr2png_summary.json", rows)
+
+
+def cmd_pose2png(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    poses = load_poses_txt(args.poses)
+    if not poses:
+        raise RuntimeError(f"No poses loaded from {args.poses}")
+    input_root = Path(args.input_dir)
+    output_root = Path(args.output_dir)
+    conventions = args.convention or list(POSE_CAMERA_CONVENTIONS.keys())
+    unknown = [name for name in conventions if name not in POSE_CAMERA_CONVENTIONS]
+    if unknown:
+        raise ValueError(f"Unknown convention(s): {unknown}. Available: {sorted(POSE_CAMERA_CONVENTIONS)}")
+    rows: list[dict[str, Any]] = []
+    montage_by_stem: dict[str, tuple[list[np.ndarray], list[str]]] = {}
+    processed = 0
+    for path in list_files(input_root, EXR_EXTS, args.recursive):
+        pose_key = pose_key_from_stem(path.stem)
+        pose_index = int(pose_key) if pose_key.isdigit() else None
+        if args.start_pose is not None and (pose_index is None or pose_index < args.start_pose):
+            continue
+        if args.end_pose is not None and (pose_index is None or pose_index > args.end_pose):
+            continue
+        if args.limit is not None and processed >= args.limit:
+            break
+        n_source, guessed, raw_arr = normal_from_exr(path, config)
+        world_to_camera, pose = pose_world_to_camera_matrix(path.stem, poses)
+        if world_to_camera is None or pose is None:
+            rows.append({"source": str(path), "error": "missing_pose", "pose_key": pose_key_from_stem(path.stem)})
+            continue
+        n_camera_ue = normalize_normal(apply_matrix(n_source, world_to_camera))
+        montage_images = [encode_packed_normal(n_source), encode_packed_normal(n_camera_ue)]
+        montage_labels = ["source world packed", "ue camera xyz"]
+        for convention in conventions:
+            conv_matrix = POSE_CAMERA_CONVENTIONS[convention]
+            n_model = normalize_normal(apply_matrix(n_camera_ue, conv_matrix))
+            packed = encode_packed_normal(n_model)
+            out_png = rel_output(path, input_root, output_root / convention, "", ".png")
+            out_png.parent.mkdir(parents=True, exist_ok=True)
+            if not args.preview_only:
+                write_png16(out_png, packed)
+            if args.save_preview:
+                preview_path = out_png.with_name(out_png.stem + "_preview.png") if not args.preview_only else out_png
+                write_png8_preview(preview_path, packed)
+            meta = {
+                "source_path": str(path),
+                "output_path": str(out_png),
+                "source_shape": list(raw_arr.shape),
+                "source_range_guess": guessed,
+                "pose_key": pose_key_from_stem(path.stem),
+                "pose_timestamp": int(pose["timestamp"]),
+                "pose_position_ue_cm": pose["position"].tolist(),
+                "pose_quaternion_xyzw": pose["quaternion_xyzw"].tolist(),
+                "rotation_world_to_camera": world_to_camera.tolist(),
+                "camera_convention": convention,
+                "camera_convention_matrix": conv_matrix.tolist(),
+                "stats_source_normal": stats_normal(n_source),
+                "stats_camera_ue_normal": stats_normal(n_camera_ue),
+                "stats_output_normal": stats_normal(n_model),
+                "quantization_error_estimate": quantization_error_estimate(n_model),
+            }
+            if not args.preview_only:
+                write_json(out_png.with_suffix(".json"), meta)
+            if args.save_npz:
+                np.savez_compressed(
+                    out_png.with_suffix(".npz"),
+                    source_normal_float32=n_source.astype(np.float32),
+                    camera_ue_normal_float32=n_camera_ue.astype(np.float32),
+                    transformed_normal_float32=n_model.astype(np.float32),
+                    rotation_world_to_camera=world_to_camera.astype(np.float32),
+                    camera_convention_matrix=conv_matrix.astype(np.float32),
+                    metadata=json.dumps(meta, ensure_ascii=False),
+                )
+            rows.append(
+                {
+                    "source": str(path),
+                    "output": str(out_png),
+                    "range": guessed,
+                    "pose_key": pose_key_from_stem(path.stem),
+                    "pose_timestamp": int(pose["timestamp"]),
+                    "camera_convention": convention,
+                }
+            )
+            if len(montage_by_stem) < args.montage_count:
+                montage_images.append(packed)
+                montage_labels.append(convention)
+        if len(montage_by_stem) < args.montage_count:
+            montage_by_stem[path.stem] = (montage_images, montage_labels)
+        processed += 1
+    write_csv(output_root / "pose2png_summary.csv", rows)
+    write_json(output_root / "pose2png_summary.json", rows)
+    for stem, (images, labels) in montage_by_stem.items():
+        make_montage(images, labels, output_root / "montage" / f"{stem}.png")
 
 
 def cmd_png2exr(args: argparse.Namespace) -> None:
@@ -791,6 +961,27 @@ def build_parser() -> argparse.ArgumentParser:
     exr2png.add_argument("--save_preview", action="store_true")
     exr2png.add_argument("--matrix_csv", help="Optional per-stem matrix CSV, for example calibration_per_pair_best.csv.")
     exr2png.set_defaults(func=cmd_exr2png)
+
+    pose2png = sub.add_parser("pose2png")
+    pose2png.add_argument("--input_dir", required=True)
+    pose2png.add_argument("--output_dir", required=True)
+    pose2png.add_argument("--config", required=True)
+    pose2png.add_argument("--poses", required=True, help="UE poses.txt with Timestamp X Y Z Qx Qy Qz Qw.")
+    pose2png.add_argument("--recursive", action="store_true")
+    pose2png.add_argument("--save_npz", action="store_true")
+    pose2png.add_argument("--save_preview", action="store_true")
+    pose2png.add_argument("--preview_only", action="store_true", help="Write PNG8 previews directly instead of PNG16 plus sidecars.")
+    pose2png.add_argument("--limit", type=int, help="Maximum number of EXR files to process.")
+    pose2png.add_argument("--start_pose", type=int, help="Only process pose indices >= this value.")
+    pose2png.add_argument("--end_pose", type=int, help="Only process pose indices <= this value.")
+    pose2png.add_argument(
+        "--convention",
+        action="append",
+        choices=sorted(POSE_CAMERA_CONVENTIONS.keys()),
+        help="Camera normal packing convention to output. Repeat to select multiple; default outputs all variants.",
+    )
+    pose2png.add_argument("--montage_count", type=int, default=24, help="Number of per-stem variant montages to write.")
+    pose2png.set_defaults(func=cmd_pose2png)
 
     png2exr = sub.add_parser("png2exr")
     png2exr.add_argument("--input_dir", required=True)
